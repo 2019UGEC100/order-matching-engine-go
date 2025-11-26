@@ -3,8 +3,9 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"sync/atomic"
 	"time"
+
+	"github.com/2019UGEC100/order-matching-engine-go/pkg/metrics"
 )
 
 var (
@@ -17,7 +18,7 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
 		"status":           "ok",
 		"uptime_sec":       int64(time.Since(startTime).Seconds()),
-		"orders_processed": atomic.LoadInt64(&ordersProcessed),
+		"orders_processed": metrics.GetOrdersProcessed(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -27,7 +28,7 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 // MetricsHandler returns simple metrics (JSON)
 func MetricsHandler(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]interface{}{
-		"orders_processed": atomic.LoadInt64(&ordersProcessed),
+		"orders_processed": metrics.GetOrdersProcessed(),
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

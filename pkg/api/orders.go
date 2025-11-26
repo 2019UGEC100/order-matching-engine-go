@@ -3,36 +3,35 @@ package api
 import (
 	"encoding/json"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/2019UGEC100/order-matching-engine-go/pkg/engine"
 	"github.com/2019UGEC100/order-matching-engine-go/pkg/model"
-	"github.com/2019UGEC100/order-matching-engine-go/pkg/store"
 )
 
+// router is set by Init
 var (
-	// Temporary globals for Step 6 (will be sharded in Step 7)
-	orderStore = store.NewStore()
-	orderBooks = make(map[string]*engine.OrderBook)
+	router     *engine.Router
+	idToSymbol = struct {
+		mu sync.RWMutex
+		m  map[string]string
+	}{m: make(map[string]string)}
 )
 
-// getOrCreateBook returns a single-symbol orderbook (not concurrency-safe here — shard in Step 7)
-func getOrCreateBook(symbol string) *engine.OrderBook {
-	ob, ok := orderBooks[symbol]
-	if !ok {
-		ob = engine.NewOrderBook(symbol)
-		orderBooks[symbol] = ob
-	}
-	return ob
+// Init wires the API package to the engine Router.
+// Call this once at server startup.
+func Init(r *engine.Router) {
+	router = r
 }
 
-// CreateOrderHandler handles POST /api/v1/orders
-// Expects JSON body matching model.Order (symbol, side, type, price (cents) for LIMIT, quantity)
+// -------------------------------
+// POST /api/v1/orders
+// -------------------------------
 func CreateOrderHandler(w http.ResponseWriter, r *http.Request) {
 	var req model.Order
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -49,57 +48,51 @@ func CreateOrderHandler(w http.ResponseWriter, r *http.Request) {
 	req.ID = uuid.NewString()
 	req.Timestamp = time.Now().UnixMilli()
 
-	// Process against the single-symbol orderbook
-	ob := getOrCreateBook(req.Symbol)
-
-	trades, err := ob.ProcessOrder(&req)
-	if err != nil {
-		// e.g., market rejection
-		writeError(w, http.StatusBadRequest, err.Error())
+	// Submit to router (which routes to correct shard)
+	if router == nil {
+		writeError(w, http.StatusInternalServerError, "router not initialized")
 		return
 	}
 
-	// If it is a resting limit order (has remaining qty), add to store for lookup/cancel
-	if req.Type == model.LIMIT && req.Quantity > 0 {
-		orderStore.Add(&req)
+	res := router.SubmitOrder(&req)
+	if res.Err != "" {
+		writeError(w, http.StatusBadRequest, res.Err)
+		return
 	}
 
-	// Build response
-	// ensure trades_executed is [] instead of null
+	// If order is now resting in book (limit with remaining), record id->symbol mapping
+	if req.Type == model.LIMIT && req.Quantity > 0 {
+		idToSymbol.mu.Lock()
+		idToSymbol.m[req.ID] = req.Symbol
+		idToSymbol.mu.Unlock()
+	}
+
+	// ensure trades_executed is [] not null
 	var tradesResp []model.Order
-	if trades == nil {
+	if res.Trades == nil {
 		tradesResp = []model.Order{}
 	} else {
-		tradesResp = trades
+		tradesResp = res.Trades
 	}
 
 	resp := map[string]interface{}{
-		"order_id":        req.ID,
-		"symbol":          req.Symbol,
-		"side":            req.Side,
-		"type":            req.Type,
-		"price":           req.Price,
-		"quantity":        req.Quantity + req.Filled, // original quantity
-		"filled_quantity": req.Filled,
-		"remaining":       req.Quantity,
+		"order_id":        res.Order.ID,
+		"symbol":          res.Order.Symbol,
+		"side":            res.Order.Side,
+		"type":            res.Order.Type,
+		"price":           res.Order.Price,
+		"quantity":        res.Order.Quantity + res.Order.Filled,
+		"filled_quantity": res.Order.Filled,
+		"remaining":       res.Order.Quantity,
 		"trades_executed": tradesResp,
 	}
 
-	// Determine status code:
-	// - 201 CREATED if resting limit order (no fills and order is resting)
-	// - 200 OK if fully filled immediately
-	// - 202 ACCEPTED if partially filled and remaining rests
-	status := http.StatusCreated
-	if req.Filled > 0 && req.Quantity == 0 {
-		status = http.StatusOK
-	} else if req.Filled > 0 && req.Quantity > 0 {
-		status = http.StatusAccepted
-	}
-
-	writeJSON(w, status, resp)
+	writeJSON(w, res.StatusCode, resp)
 }
 
-// OrderByIDHandler dispatches GET/DELETE for /api/v1/orders/{id}
+// -------------------------------
+// GET/DELETE dispatcher
+// -------------------------------
 func OrderByIDHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -111,15 +104,28 @@ func OrderByIDHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// GetOrderHandler handles GET /api/v1/orders/{id}
+// -------------------------------
+// GET /api/v1/orders/{id}
+// -------------------------------
 func GetOrderHandler(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r.URL.Path)
-	o, err := orderStore.Get(id)
-	if err != nil {
+
+	// lookup symbol
+	idToSymbol.mu.RLock()
+	sym, ok := idToSymbol.m[id]
+	idToSymbol.mu.RUnlock()
+	if !ok {
 		writeError(w, http.StatusNotFound, "order not found")
 		return
 	}
 
+	res := router.GetOrder(sym, id)
+	if res.Err != "" || res.Order == nil {
+		writeError(w, http.StatusNotFound, "order not found")
+		return
+	}
+
+	o := res.Order
 	resp := map[string]interface{}{
 		"order_id":        o.ID,
 		"symbol":          o.Symbol,
@@ -134,69 +140,45 @@ func GetOrderHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// CancelOrderHandler handles DELETE /api/v1/orders/{id}
+// -------------------------------
+// DELETE /api/v1/orders/{id}
+// -------------------------------
 func CancelOrderHandler(w http.ResponseWriter, r *http.Request) {
 	id := pathParam(r.URL.Path)
 
-	o, err := orderStore.Get(id)
-	if err != nil {
+	// lookup symbol
+	idToSymbol.mu.RLock()
+	sym, ok := idToSymbol.m[id]
+	idToSymbol.mu.RUnlock()
+	if !ok {
 		writeError(w, http.StatusNotFound, "order not found")
 		return
 	}
 
-	// If filled completely already
-	if o.Filled >= o.Quantity {
-		writeError(w, http.StatusBadRequest, "cannot cancel a fully filled order")
+	res := router.CancelOrder(sym, id)
+	if !res.OK {
+		writeError(w, http.StatusBadRequest, res.Err)
 		return
 	}
 
-	// Remove from in-memory order store
-	if err := orderStore.Remove(id); err != nil {
-		writeError(w, http.StatusNotFound, "order not found")
-		return
-	}
-
-	// ALSO remove from the orderbook (price level) so book view is consistent.
-	// This is safe in Step 6 (single-threaded). In Step 7, shard-owner will do this.
-	ob := getOrCreateBook(o.Symbol)
-	var sideMap map[int64]*engine.PriceLevel
-	if o.Side == model.BUY {
-		sideMap = ob.Bids
-	} else {
-		sideMap = ob.Asks
-	}
-
-	level, ok := sideMap[o.Price]
-	if ok {
-		// find and remove the order from the level.Orders slice
-		newOrders := level.Orders[:0]
-		for _, ord := range level.Orders {
-			if ord.ID == o.ID {
-				// skip — effectively removing this order
-				continue
-			}
-			newOrders = append(newOrders, ord)
-		}
-		level.Orders = newOrders
-
-		// if level empty, delete the price level map entry
-		if len(level.Orders) == 0 {
-			if o.Side == model.BUY {
-				delete(ob.Bids, o.Price)
-			} else {
-				delete(ob.Asks, o.Price)
-			}
-		}
-	}
+	// remove mapping
+	idToSymbol.mu.Lock()
+	delete(idToSymbol.m, id)
+	idToSymbol.mu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
 }
 
-// GetOrderBookHandler handles GET /api/v1/orderbook/{symbol}?depth=N
+// -------------------------------
+// GET /api/v1/orderbook/{symbol}?depth=N
+// -------------------------------
 func GetOrderBookHandler(w http.ResponseWriter, r *http.Request) {
-	symbol := pathParam(r.URL.Path)
-	ob := getOrCreateBook(symbol)
+	if router == nil {
+		writeError(w, http.StatusInternalServerError, "router not initialized")
+		return
+	}
 
+	symbol := pathParam(r.URL.Path)
 	depth := 10
 	if ds := r.URL.Query().Get("depth"); ds != "" {
 		if d, err := strconv.Atoi(ds); err == nil && d > 0 {
@@ -204,10 +186,12 @@ func GetOrderBookHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	snap := router.GetOrderBook(symbol, depth)
+
 	resp := map[string]interface{}{
 		"symbol": symbol,
-		"bids":   aggregate(ob.Bids, depth, false), // highest first
-		"asks":   aggregate(ob.Asks, depth, true),  // lowest first
+		"bids":   snap.Bids,
+		"asks":   snap.Asks,
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -228,39 +212,4 @@ func writeJSON(w http.ResponseWriter, status int, body interface{}) {
 func pathParam(path string) string {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	return parts[len(parts)-1]
-}
-
-func aggregate(side map[int64]*engine.PriceLevel, depth int, asc bool) []map[string]interface{} {
-	if depth <= 0 {
-		return []map[string]interface{}{}
-	}
-
-	prices := make([]int64, 0, len(side))
-	for p := range side {
-		prices = append(prices, p)
-	}
-
-	if asc {
-		sort.Slice(prices, func(i, j int) bool { return prices[i] < prices[j] })
-	} else {
-		sort.Slice(prices, func(i, j int) bool { return prices[i] > prices[j] })
-	}
-
-	out := make([]map[string]interface{}, 0, depth)
-	for _, p := range prices {
-		if len(out) >= depth {
-			break
-		}
-		level := side[p]
-		total := int64(0)
-		for _, o := range level.Orders {
-			// remaining quantity per order
-			total += (o.Quantity - o.Filled)
-		}
-		out = append(out, map[string]interface{}{
-			"price":    p,
-			"quantity": total,
-		})
-	}
-	return out
 }

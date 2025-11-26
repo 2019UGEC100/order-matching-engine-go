@@ -4,24 +4,44 @@ import (
 	"context"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
 	"time"
 
 	"github.com/2019UGEC100/order-matching-engine-go/pkg/api"
+	"github.com/2019UGEC100/order-matching-engine-go/pkg/engine"
 )
 
 func main() {
 	// use all available CPUs
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	// Create router with N shards and buffer size 1024
+	router := engine.NewRouter(runtime.NumCPU(), 1024)
+	// Ensure graceful stop on exit
+	defer router.Stop()
+
+	// Initialize API package with router
+	api.Init(router)
+
+	// Start pprof server on :6060
+	go func() {
+		log.Println("pprof server on :6060")
+		if err := http.ListenAndServe(":6060", nil); err != nil {
+			log.Println("pprof listen error:", err)
+		}
+	}()
+
 	mux := http.NewServeMux()
 	// health & metrics handlers
 	mux.HandleFunc("/health", api.HealthHandler)
 	mux.HandleFunc("/metrics", api.MetricsHandler)
-	mux.HandleFunc("/api/v1/orders", api.CreateOrderHandler)
-	mux.HandleFunc("/api/v1/orders/", api.OrderByIDHandler)
+
+	// Orders API
+	mux.HandleFunc("/api/v1/orders", api.CreateOrderHandler) // POST
+	mux.HandleFunc("/api/v1/orders/", api.OrderByIDHandler)  // GET/DELETE by id
 	mux.HandleFunc("/api/v1/orderbook/", api.GetOrderBookHandler)
 
 	srv := &http.Server{
