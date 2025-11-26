@@ -71,3 +71,22 @@ Summary:
 
 Final Recommendation:
 Use host-native results for primary benchmarking. Docker results included for reproducibility.
+---
+
+## Host-native final run (added on 2025-11-27 04:26:45Z)
+
+**Command**
+go run ./cmd/load -url http://127.0.0.1:8080/api/v1/orders -c 100 -n 50000 -sym LOAD -sleep 1 -stats
+
+**Summary**
+- total_requests: 50000
+- concurrency: 100
+- duration_sec: 34.0980
+- req_per_sec: 1466.36
+- mean_ms: 66.147
+- max_ms: 222.070
+- p50_ms: 51.758
+- p90_ms: 130.974
+- p99_ms: 171.741
+
+_Notes:_ This run was executed with the server running in Docker/locally on the same host. Host?container NAT may increase latency vs purely native runs; container?container runs are also included earlier in this document.
