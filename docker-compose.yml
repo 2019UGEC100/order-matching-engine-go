@@ -1,0 +1,20 @@
+version: "3.8"
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    image: ome-server:latest
+    ports:
+      - "8080:8080"
+      - "6060:6060"
+
+  load:
+    build:
+      context: .
+      dockerfile: Dockerfile.load
+    image: ome-load:latest
+    command: ["-c", "50", "-n", "20000", "-sym", "LOAD", "-sleep", "1", "-stats"]
+    depends_on:
+      - server
