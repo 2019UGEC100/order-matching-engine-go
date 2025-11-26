@@ -20,6 +20,9 @@ func main() {
 	// health & metrics handlers
 	mux.HandleFunc("/health", api.HealthHandler)
 	mux.HandleFunc("/metrics", api.MetricsHandler)
+	mux.HandleFunc("/api/v1/orders", api.CreateOrderHandler)
+	mux.HandleFunc("/api/v1/orders/", api.OrderByIDHandler)
+	mux.HandleFunc("/api/v1/orderbook/", api.GetOrderBookHandler)
 
 	srv := &http.Server{
 		Addr:         ":8080",
