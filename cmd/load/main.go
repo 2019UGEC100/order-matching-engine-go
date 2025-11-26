@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -33,6 +35,13 @@ type StatsSummary struct {
 	P99Ms         float64 `json:"p99_ms"`
 }
 
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func main() {
 	var (
 		urlFlag   = flag.String("url", "http://localhost:8080/api/v1/orders", "orders endpoint")
@@ -44,29 +53,32 @@ func main() {
 	)
 	flag.Parse()
 
+	// Prefer IPv4 loopback so Windows doesn't pick ::1 unexpectedly
 	if *urlFlag == "http://localhost:8080/api/v1/orders" {
 		*urlFlag = "http://127.0.0.1:8080/api/v1/orders"
 	}
 
-	// tuned transport for heavy load: reuse connections, avoid ephemeral port exhaustion
+	// Seed RNG for jitter
+	rand.Seed(time.Now().UnixNano())
+
+	// Tuned transport for heavy load and connection reuse
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 			DualStack: true,
 		}).DialContext,
-		MaxIdleConns:          0,      // unlimited global idle connections
-		MaxIdleConnsPerHost:   *conns, // keep at most `conns` idle per host
-		MaxConnsPerHost:       *conns, // do not open more than `conns` concurrent connections to host
-		IdleConnTimeout:       90 * time.Second,
-		DisableKeepAlives:     false,
-		ForceAttemptHTTP2:     false, // disable HTTP/2 for more predictable behavior on Windows
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
+		MaxIdleConns:        0, // unlimited global idle conns
+		MaxIdleConnsPerHost: maxInt(*conns, 1000),
+		MaxConnsPerHost:     maxInt(*conns, 1000),
+		IdleConnTimeout:     90 * time.Second,
+		DisableKeepAlives:   false,
+		ForceAttemptHTTP2:   false,
+		TLSHandshakeTimeout: 10 * time.Second,
 	}
 	client := &http.Client{
 		Transport: transport,
-		Timeout:   20 * time.Second,
+		Timeout:   30 * time.Second,
 	}
 
 	// Prepare workload distribution
@@ -82,7 +94,7 @@ func main() {
 	worker := func(id int) {
 		defer wg.Done()
 		for j := 0; j < reqsPerWorker; j++ {
-			// stop early if we've already sent enough requests
+			// stop early if we've already recorded enough requests
 			mu.Lock()
 			sent := len(durations)
 			mu.Unlock()
@@ -97,18 +109,48 @@ func main() {
 				Price:    100 + int64(id%10),
 				Quantity: 1,
 			}
-			b, _ := json.Marshal(r)
-			req, _ := http.NewRequest("POST", *urlFlag, bytes.NewReader(b))
-			req.Header.Set("Content-Type", "application/json")
 
+			// marshal once per logical request
+			b, _ := json.Marshal(r)
+
+			// record start if in stats mode
 			var t0 time.Time
 			if *statsMode {
 				t0 = time.Now()
 			}
-			resp, err := client.Do(req)
-			if err == nil && resp.Body != nil {
+
+			// Retry loop with fresh http.Request per attempt
+			var resp *http.Response
+			var err error
+			maxRetries := 5
+			baseDelay := 50 * time.Millisecond
+
+			for attempt := 0; attempt <= maxRetries; attempt++ {
+				// create a fresh request for this attempt (new Body reader)
+				req, _ := http.NewRequest("POST", *urlFlag, bytes.NewReader(b))
+				req.Header.Set("Content-Type", "application/json")
+
+				resp, err = client.Do(req)
+				if err == nil {
+					break
+				}
+				// backoff with jitter
+				backoff := time.Duration(float64(baseDelay) * math.Pow(2, float64(attempt)))
+				jitter := time.Duration(rand.Int63n(int64(backoff/2) + 1))
+				if rand.Intn(2) == 0 {
+					backoff -= jitter
+				} else {
+					backoff += jitter
+				}
+				time.Sleep(backoff)
+			}
+
+			// close response body if present
+			if err == nil && resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
+
+			// record timing if statsMode
 			if *statsMode {
 				elapsed := time.Since(t0).Seconds() * 1000.0 // ms
 				mu.Lock()
@@ -116,6 +158,7 @@ func main() {
 				mu.Unlock()
 			}
 
+			// log error if it persisted after retries
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "request error: %v\n", err)
 			}
@@ -123,6 +166,8 @@ func main() {
 			if *sleepMs > 0 {
 				time.Sleep(time.Duration(*sleepMs) * time.Millisecond)
 			}
+			// --- REPLACEMENT END ---
+
 		}
 	}
 
@@ -135,10 +180,11 @@ func main() {
 	wg.Wait()
 	elapsedTotal := time.Since(start).Seconds()
 	sent := len(durations)
-	// If statsMode=false, we still report totals based on total flag
+
+	// If statsMode=false, print a simple summary and exit
 	if !*statsMode {
-		// best-effort: estimate req/s based on total param and runtime
-		fmt.Printf("done: total=%d concurrency=%d duration=%v req/s=%.2f\n", *total, *conns, time.Duration(elapsedTotal*1e9), float64(*total)/elapsedTotal)
+		fmt.Printf("done: total=%d concurrency=%d duration=%v req/s=%.2f\n",
+			*total, *conns, time.Duration(elapsedTotal*1e9), float64(*total)/elapsedTotal)
 		return
 	}
 
@@ -167,7 +213,8 @@ func main() {
 		if sent == 0 {
 			return 0
 		}
-		idx := int(float64(sent-1) * q)
+		// nearest-rank style
+		idx := int(math.Floor(q*float64(sent-1) + 0.5))
 		if idx < 0 {
 			idx = 0
 		}
@@ -190,8 +237,10 @@ func main() {
 	}
 
 	// Print plain
-	fmt.Printf("SUMMARY: total=%d concurrency=%d duration=%.2fs req/s=%.2f\n", summary.TotalRequests, summary.Concurrency, summary.DurationSec, summary.ReqPerSec)
-	fmt.Printf("LATENCY(ms): mean=%.3f max=%.3f p50=%.3f p90=%.3f p99=%.3f\n", summary.MeanMs, summary.MaxMs, summary.P50Ms, summary.P90Ms, summary.P99Ms)
+	fmt.Printf("SUMMARY: total=%d concurrency=%d duration=%.2fs req/s=%.2f\n",
+		summary.TotalRequests, summary.Concurrency, summary.DurationSec, summary.ReqPerSec)
+	fmt.Printf("LATENCY(ms): mean=%.3f max=%.3f p50=%.3f p90=%.3f p99=%.3f\n",
+		summary.MeanMs, summary.MaxMs, summary.P50Ms, summary.P90Ms, summary.P99Ms)
 
 	// Print JSON
 	js, _ := json.MarshalIndent(summary, "", "  ")
